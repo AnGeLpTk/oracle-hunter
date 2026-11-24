@@ -1,0 +1,26 @@
+#cloud-config
+# Bootstrap da VPS sem registrar o runner (o token do GitHub expira em 1h).
+# Instala Docker e deixa o GitHub Actions runner baixado em /opt/actions-runner;
+# o registro (config.sh) é feito depois via Run Command da Oracle.
+package_update: true
+packages:
+  - curl
+  - jq
+  - git
+  - tar
+runcmd:
+  - |
+    set -e
+    id runner >/dev/null 2>&1 || useradd -m -s /bin/bash runner
+    echo "runner ALL=(ALL) NOPASSWD:ALL" > /etc/sudoers.d/runner
+    chmod 440 /etc/sudoers.d/runner
+    curl -fsSL https://get.docker.com | sh
+    usermod -aG docker runner
+    VER=$(curl -fsSL https://api.github.com/repos/actions/runner/releases/latest | jq -r .tag_name | sed 's/^v//')
+    mkdir -p /opt/actions-runner
+    cd /opt/actions-runner
+    curl -fsSL -o runner.tgz "https://github.com/actions/runner/releases/download/v${VER}/actions-runner-linux-arm64-${VER}.tar.gz"
+    tar xzf runner.tgz
+    rm runner.tgz
+    ./bin/installdependencies.sh
+    chown -R runner:runner /opt/actions-runner

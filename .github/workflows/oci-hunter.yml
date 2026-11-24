@@ -1,0 +1,248 @@
+name: Cacar instancia Oracle
+
+# Cria a VPS ARM (Always Free) com 1 OCPU / 6 GB (mais facil de achar vaga) e depois tenta AUMENTAR para 2 OCPU / 12 GB no mesmo ritmo.
+# - Job de ~6h tentando a cada 2 min; o cron horario deixa o proximo na fila (concurrency), entao comeca assim que o anterior termina: sem intervalo.
+# - Ao terminar sem sucesso, dispara a proxima rodada sozinho (o cron e so reserva).
+# - "Too many requests": pausa 10 min antes de tentar de novo.
+# Avisa por issue (notifica o dono) ao criar e ao aumentar; so desliga este workflow quando a VM estiver em 2 OCPU / 12 GB.
+on:
+  schedule:
+    - cron: '5 * * * *'
+  workflow_dispatch:
+    inputs:
+      minutos:
+        description: 'Por quantos minutos ficar tentando (0 = uma tentativa)'
+        default: '355'
+
+permissions:
+  contents: read
+  issues: write
+  actions: write
+
+concurrency:
+  group: oci-hunter
+  cancel-in-progress: false
+
+env:
+  OCI_REGION: sa-saopaulo-1
+  INSTANCE_NAME: Tibia-Idle
+  AD: bFXi:SA-SAOPAULO-1-AD-1
+  OCPUS: '1'
+  MEMORY_GB: '6'
+  TARGET_OCPUS: '2'
+  TARGET_MEMORY_GB: '12'
+  BOOT_GB: '100'
+  IMAGE_ID: ocid1.image.oc1.sa-saopaulo-1.aaaaaaaaw5a236wd55o7ecdrk5xmyuuiobzyidi2trqrgexeyt4rm3ytl7sa
+  SUBNET_ID: ocid1.subnet.oc1.sa-saopaulo-1.aaaaaaaa7h46f44jd6nqklxsd5jagt4r23lhryjdqqfo2xtfgtl3odgnqdeq
+  SSH_PUBLIC_KEY: ssh-rsa AAAAB3NzaC1yc2EAAAADAQABAAABAQCqrllFqM9wV/D3ma8saJYa28fy5Mk3ME3a3oPp+unF7D8kCD1mlr9G50TL+1uR/oR1ELxuUjH/BuuCebvLpeD5UyG9aAb5z7TsaL0ouxzlhUUC5zsLN/wLAnpBuULr5YGpTN0mENEUMgYXLA6EySKBEXImNUzMTM1AlDti/eGD7SqM57AsNc86CM/FK1/WKQJALybaEQA9Fo3Ti9LaKPmh63+xS03/PLqx3qp0HAzTnThLatuQzB/F2X1r8EXz4COhUdhn+0pfWfvEOWZm3zOszWl17pak0qti2cdo4P/wJJjURSA60D/aHtcyARAQfkEcBrb+3N1ObykN9X7VY+PL ssh-key-2026-11-24
+
+jobs:
+  launch:
+    runs-on: ubuntu-latest
+    timeout-minutes: 359
+    env:
+      OCI_USER: ${{ secrets.OCI_USER }}
+      OCI_TENANCY: ${{ secrets.OCI_TENANCY }}
+      OCI_FINGERPRINT: ${{ secrets.OCI_FINGERPRINT }}
+      OCI_KEY: ${{ secrets.OCI_KEY }}
+    steps:
+      - name: Conferir segredos
+        id: check
+        run: |
+          if [ -z "$OCI_USER" ] || [ -z "$OCI_TENANCY" ] || [ -z "$OCI_FINGERPRINT" ] || [ -z "$OCI_KEY" ]; then
+            echo "::notice::Secrets da Oracle ainda nao configurados; nada a fazer."
+            echo "ok=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "ok=true" >> "$GITHUB_OUTPUT"
+          fi
+
+      - uses: actions/checkout@v4
+        if: steps.check.outputs.ok == 'true'
+
+      - uses: actions/setup-python@v5
+        if: steps.check.outputs.ok == 'true'
+        with:
+          python-version: '3.12'
+          cache: pip
+          cache-dependency-path: infra/oci-requirements.txt
+
+      - name: Instalar e configurar OCI CLI
+        if: steps.check.outputs.ok == 'true'
+        run: |
+          pip install -q -r infra/oci-requirements.txt
+          mkdir -p ~/.oci
+          printf '%s\n' "$OCI_KEY" > ~/.oci/key.pem
+          chmod 600 ~/.oci/key.pem
+          {
+            echo "[DEFAULT]"
+            echo "user=$OCI_USER"
+            echo "fingerprint=$OCI_FINGERPRINT"
+            echo "tenancy=$OCI_TENANCY"
+            echo "region=$OCI_REGION"
+            echo "key_file=$HOME/.oci/key.pem"
+          } > ~/.oci/config
+          chmod 600 ~/.oci/config
+
+      - name: Criar e aumentar a instancia
+        id: launch
+        if: steps.check.outputs.ok == 'true'
+        env:
+          INPUT_MINUTOS: ${{ github.event.inputs.minutos }}
+        run: |
+          if [ -n "$INPUT_MINUTOS" ]; then MINUTOS="$INPUT_MINUTOS"
+          else MINUTOS=355; fi
+          FIM=$(( $(date +%s) + MINUTOS * 60 ))
+          echo "$SSH_PUBLIC_KEY" > "$RUNNER_TEMP/ssh.pub"
+
+          # Consulta o estado da instancia. Retorna 0 = consulta ok (INST_ID vazio = nao existe), 1 = falhou.
+          consultar() {
+            INST_ID=""; INST_STATE=""; INST_OCPUS=0
+            local LOUT LRC LINHA
+            set +e
+            LOUT=$(timeout 90 oci compute instance list -c "$OCI_TENANCY" --display-name "$INSTANCE_NAME" \
+              --no-retry --connection-timeout 20 --read-timeout 60 2>"$RUNNER_TEMP/list.err")
+            LRC=$?
+            set -e
+            if [ $LRC -ne 0 ]; then
+              if [ $LRC -eq 124 ]; then QMSG="Timeout na consulta OCI"
+              else QMSG=$(grep -o '"message": "[^"]*' "$RUNNER_TEMP/list.err" | cut -c13- | head -1); fi
+              QMSG="${QMSG:-falha na consulta OCI (rc=$LRC)}"
+              return 1
+            fi
+            if [ -z "$LOUT" ]; then return 0; fi
+            LINHA=$(echo "$LOUT" | jq -r '(.data // []) | map(select(."lifecycle-state" != "TERMINATED")) | .[0] // empty | [.id, ."lifecycle-state", ((."shape-config".ocpus // 0) | floor)] | @tsv') || {
+              QMSG="Resposta da consulta OCI ilegivel"; return 1; }
+            if [ -n "$LINHA" ]; then
+              IFS=$'\t' read -r INST_ID INST_STATE INST_OCPUS <<< "$LINHA"
+            fi
+            return 0
+          }
+
+          # Espera $1 segundos; retorna 1 se nao der tempo antes do fim da rodada.
+          pausa() {
+            if [ $(( $(date +%s) + $1 )) -ge "$FIM" ]; then return 1; fi
+            sleep "$1"
+          }
+
+          # Classifica a mensagem de erro e define ESPERA (ou aborta em erro inesperado).
+          classificar() {
+            case "$MSG" in
+              *apacity*) ESPERA=120 ;;
+              *"Too many requests"*|*TooManyRequests*) ESPERA=600 ;;
+              *Timeout*|*timed\ out*|*"Connection"*) ESPERA=60 ;;
+              *Conflict*|*IncorrectState*|*"state"*) ESPERA=60 ;;
+              *) echo "::error::Erro inesperado (nao e falta de capacidade): ${MSG:-$OUT}"; exit 1 ;;
+            esac
+          }
+
+          RESULT=retry
+          N=0
+          while true; do
+            if ! consultar; then
+              echo "$(date -u +%H:%M:%S) UTC consulta falhou: ${QMSG}"
+              pausa 60 || break
+              continue
+            fi
+
+            if [ -z "$INST_ID" ]; then
+              N=$((N+1))
+              ROT="tentativa"
+              set +e
+              OUT=$(timeout 120 oci compute instance launch --no-retry --connection-timeout 20 --read-timeout 60 \
+                --compartment-id "$OCI_TENANCY" \
+                --availability-domain "$AD" \
+                --display-name "$INSTANCE_NAME" \
+                --shape VM.Standard.A1.Flex \
+                --shape-config "{\"ocpus\":$OCPUS,\"memoryInGBs\":$MEMORY_GB}" \
+                --image-id "$IMAGE_ID" \
+                --subnet-id "$SUBNET_ID" \
+                --assign-public-ip true \
+                --boot-volume-size-in-gbs "$BOOT_GB" \
+                --ssh-authorized-keys-file "$RUNNER_TEMP/ssh.pub" \
+                --user-data-file infra/cloud-init-base.yaml 2>&1)
+              RC=$?
+              set -e
+              if [ $RC -eq 0 ]; then
+                echo "::notice::Instancia criada na tentativa $N: $(echo "$OUT" | jq -r '.data.id')"
+                echo "created=true" >> "$GITHUB_OUTPUT"
+                pausa 60 || break
+                continue
+              fi
+            elif [ "$INST_OCPUS" -ge "$TARGET_OCPUS" ]; then
+              RESULT=done
+              break
+            else
+              case "$INST_STATE" in
+                PROVISIONING|STARTING|STOPPING)
+                  echo "$(date -u +%H:%M:%S) UTC instancia em $INST_STATE; aguardando"
+                  pausa 60 || break
+                  continue ;;
+                STOPPED)
+                  echo "$(date -u +%H:%M:%S) UTC instancia parada; iniciando"
+                  set +e
+                  timeout 120 oci compute instance action --instance-id "$INST_ID" --action START \
+                    --no-retry --connection-timeout 20 --read-timeout 60 >/dev/null 2>&1
+                  set -e
+                  pausa 60 || break
+                  continue ;;
+                RUNNING) ;;
+                *)
+                  echo "$(date -u +%H:%M:%S) UTC instancia em estado $INST_STATE; aguardando"
+                  pausa 60 || break
+                  continue ;;
+              esac
+              N=$((N+1))
+              ROT="redimensionar"
+              set +e
+              OUT=$(timeout 120 oci compute instance update --instance-id "$INST_ID" \
+                --shape-config "{\"ocpus\":$TARGET_OCPUS,\"memoryInGBs\":$TARGET_MEMORY_GB}" \
+                --force --no-retry --connection-timeout 20 --read-timeout 60 2>&1)
+              RC=$?
+              set -e
+              if [ $RC -eq 0 ]; then
+                echo "::notice::Instancia aumentada para $TARGET_OCPUS OCPU / $TARGET_MEMORY_GB GB na tentativa $N"
+                echo "resized=true" >> "$GITHUB_OUTPUT"
+                RESULT=done
+                break
+              fi
+            fi
+
+            MSG=$(echo "$OUT" | grep -o '"message": "[^"]*' | cut -c13- | head -1)
+            if [ $RC -eq 124 ]; then MSG="Timeout na chamada OCI"; fi
+            echo "$(date -u +%H:%M:%S) UTC $ROT $N: ${MSG:-$OUT}"
+            classificar
+            pausa "$ESPERA" || break
+          done
+          if [ "$RESULT" = "done" ]; then
+            echo "::notice::Instancia em $TARGET_OCPUS OCPU / $TARGET_MEMORY_GB GB."
+          else
+            echo "::notice::Sem sucesso nesta rodada ($N tentativas)."
+          fi
+          echo "result=$RESULT" >> "$GITHUB_OUTPUT"
+
+      - name: Avisar criacao
+        if: steps.launch.outputs.created == 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh issue create -R "$GITHUB_REPOSITORY" \
+            --title "Instancia Oracle criada (1 OCPU / 6 GB)!" \
+            --body "@AnGeLpTk a VPS ARM foi criada com $OCPUS OCPU / $MEMORY_GB GB. A cacada continua tentando aumentar para $TARGET_OCPUS OCPU / $TARGET_MEMORY_GB GB (cada aumento reinicia a VM uma vez). Abra o console da Oracle para ver o IP."
+
+      - name: Avisar e desligar a cacada
+        if: steps.launch.outputs.result == 'done'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          if [ "${{ steps.launch.outputs.resized }}" = "true" ]; then
+            gh issue create -R "$GITHUB_REPOSITORY" \
+              --title "Instancia Oracle aumentada para 2 OCPU / 12 GB!" \
+              --body "@AnGeLpTk a VPS foi redimensionada para $TARGET_OCPUS OCPU / $TARGET_MEMORY_GB GB e reiniciou. Cacada desligada."
+          fi
+          gh workflow disable "$GITHUB_WORKFLOW" -R "$GITHUB_REPOSITORY"
+
+      - name: Encadear proxima rodada
+        if: steps.launch.outputs.result == 'retry' && (github.event_name == 'schedule' || github.event.inputs.minutos == '' || github.event.inputs.minutos == '355')
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh workflow run "${{ github.workflow }}" -R "$GITHUB_REPOSITORY" --ref "$GITHUB_REF_NAME"
